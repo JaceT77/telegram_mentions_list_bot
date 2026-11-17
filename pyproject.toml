@@ -1,0 +1,9 @@
+[project]
+name = "telegram-mentions-list-bot"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "pytdbot>=0.10.1",
+    "python-dotenv>=1.2.4",
+    "tdjson==1.8.65",
+]
