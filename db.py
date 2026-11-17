@@ -51,6 +51,8 @@ def init() -> None:
     )
     if "jump_msg_id" not in {r["name"] for r in _conn.execute("PRAGMA table_info(mentions)")}:
         _conn.execute("ALTER TABLE mentions ADD COLUMN jump_msg_id INTEGER")  # databases from older versions
+    if "jump_note" not in {r["name"] for r in _conn.execute("PRAGMA table_info(mentions)")}:
+        _conn.execute("ALTER TABLE mentions ADD COLUMN jump_note TEXT")
     _conn.execute("DELETE FROM closed WHERE closed_at < ?", (int(time.time()) - CLOSED_KEEP_SECONDS,))
 
 
@@ -91,7 +93,11 @@ def set_bot_msg_id(row_id: int, bot_msg_id: int) -> None:
     _conn.execute("UPDATE mentions SET bot_msg_id = ? WHERE id = ?", (bot_msg_id, row_id))
 
 
-def set_jump_msg_id(row_id: int, jump_msg_id: int | None) -> None:
+def set_jump_note(row_id: int, note: str | None) -> None:
+    _conn.execute("UPDATE mentions SET jump_note = ? WHERE id = ?", (note, row_id))
+
+
+def set_jump_msg_id(row_id: int, jump_msg_id: str | None) -> None:  # comma-separated ids
     _conn.execute("UPDATE mentions SET jump_msg_id = ? WHERE id = ?", (jump_msg_id, row_id))
 
 

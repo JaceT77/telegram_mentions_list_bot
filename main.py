@@ -77,6 +77,14 @@ for _client in (user, bot):
     _client._print_welcome = lambda: None  # pytdbot's banner would print over the login prompt
 
 owner_id = 0
+LIST_BUTTON = "📋 Все задачи"
+MAIN_KEYBOARD = types.ReplyMarkupShowKeyboard(
+    rows=[[types.KeyboardButton(text=LIST_BUTTON, type=types.KeyboardButtonTypeText())]], resize_keyboard=True,
+    is_persistent=True,
+)
+# Testing: post both the forward and the quote-reply above each basic-group card.
+# Set to False to use them as fallbacks (forward first, quote-reply only if forwarding isn't allowed).
+TEST_ALL_JUMPS = False
 bot_chat_id = 0  # the owner's chat with the bot, as seen from the owner's account
 owner_ready = asyncio.Event()  # both clients logged in; handlers wait for this
 stopping = asyncio.Event()
@@ -119,7 +127,7 @@ async def login_step(call, prompt: str, secret: bool = False) -> None:
         result = await call(value)
         if not isinstance(result, types.Error):
             return
-        print(f"  Error: {result.message}")
+        print(f"  Ошибка: {result.message}. Попробуйте ещё раз.")
 
 
 @user.on_updateAuthorizationState()
@@ -127,25 +135,25 @@ async def on_auth(c: Client, u: types.UpdateAuthorizationState) -> None:
     st = u.authorization_state
     if isinstance(st, types.AuthorizationStateWaitPhoneNumber):
         await login_step(lambda v: c.setAuthenticationPhoneNumber(phone_number=v),
-                         "Phone number (international format, starting with +): ")
+                         "Номер телефона (в формате +998...): ")
     elif isinstance(st, types.AuthorizationStateWaitEmailAddress):
         await login_step(lambda v: c.setAuthenticationEmailAddress(email_address=v),
-                         "Email address for login codes: ")
+                         "Электронная почта для кодов входа: ")
     elif isinstance(st, types.AuthorizationStateWaitEmailCode):
         await login_step(lambda v: c.checkAuthenticationEmailCode(code=types.EmailAddressAuthenticationCode(code=v)),
-                         "Code sent to your email: ")
+                         "Код из письма на почте: ")
     elif isinstance(st, types.AuthorizationStateWaitCode):
         await login_step(lambda v: c.checkAuthenticationCode(code=v),
-                         "Login code (look in your Telegram app): ")
+                         "Код входа (пришёл в Telegram): ")
     elif isinstance(st, types.AuthorizationStateWaitPassword):
         await login_step(lambda v: c.checkAuthenticationPassword(password=v),
-                         "Two-step verification password: ", secret=True)
+                         "Облачный пароль Telegram: ", secret=True)
     elif isinstance(st, (types.AuthorizationStateLoggingOut, types.AuthorizationStateClosed)):
         if owner_ready.is_set() and not shutting_down and not stopping.is_set():
             stopping.set()
             log.error("Telegram logged the tracker out (session terminated?). Start it again to log in.")
-            await bot_send("⚠️ The tracker was logged out of your Telegram account. "
-                           "Start it again on the laptop and log in.")
+            await bot_send("⚠️ Бот отключён от вашего Telegram.\n"
+                           "Запустите его снова на ноутбуке и войдите.")
     elif not isinstance(st, (types.AuthorizationStateWaitTdlibParameters, types.AuthorizationStateReady,
                              types.AuthorizationStateClosing)):
         log.error("Login step %s isn't supported. Log in with an official app first, then retry.", st.getType())
@@ -207,23 +215,26 @@ def button(label: str, data: str) -> types.InlineKeyboardButton:
 
 
 def render(row, final: str | None = None) -> tuple[str, types.ReplyMarkupInlineKeyboard | None]:
-    status = final or ("👁 Read" if row["is_read"] else "🔴 New")
+    status = final or ("👁 Прочитано" if row["is_read"] else "🔴 НОВОЕ")
     when = datetime.fromtimestamp(row["date"]).strftime("%d.%m %H:%M")
     lines = [
         f"<b>{status}</b>",
-        f"<b>{esc(row['chat_title'] or '?')}</b> · {esc(row['sender'] or '?')} · {when}",
+        f"👥 Группа: <b>{esc(row['chat_title'] or '?')}</b>",
+        f"👤 Кто: {esc(row['sender'] or '?')}",
+        f"🕒 Когда: {when}",
         f"<blockquote>{esc(clip(row['text'] or '—'))}</blockquote>",
     ]
     if final:
         return "\n".join(lines), None  # closed: no link, no buttons
-    if row["jump_msg_id"]:
-        lines.append("👆 To open the message, click the quote in your message above")
-    elif row["link"]:
-        label = "Open message (phone app)" if row["link"].startswith("tg://") else "Open message"
-        lines.append(f'<a href="{esc(row["link"])}">{label}</a>')
+    if row["link"]:  # 1st way: a link (real for supergroups, phone-only deep link for basic groups)
+        label = "Открыть сообщение (на телефоне)" if row["link"].startswith("tg://") else "Открыть сообщение"
+        lines.append(f'➡️ <a href="{esc(row["link"])}">{label}</a>')
+    if row["jump_msg_id"]:  # 2nd/3rd way: a forward or quote-reply of the original, posted just above
+        lines.append("👆 Само сообщение — выше")
+    lines.append("\nКогда разберётесь — нажмите «✅ Готово»")
     text = "\n".join(lines)
-    buttons = [] if row["is_read"] else [button("👁 Read", f"r:{row['id']}")]
-    buttons.append(button("✅ Done", f"d:{row['id']}"))
+    buttons = [] if row["is_read"] else [button("👁 Прочитал", f"r:{row['id']}")]
+    buttons.append(button("✅ Готово", f"d:{row['id']}"))
     return text, types.ReplyMarkupInlineKeyboard(rows=[buttons])
 
 
@@ -240,27 +251,71 @@ async def confirmed(send):
         return types.Error(code=408, message="No confirmation from Telegram")
 
 
-async def send_jump(row) -> int | None:
-    """Basic groups have no message links. Instead, from the owner's account, post a reply to the
-    original message into the bot chat: clicking its quote opens the message on desktop and phone."""
-    if not bot_chat_id or not is_basic_group_id(row["chat_id"]):
-        return None
-    props = await user.getMessageProperties(chat_id=row["chat_id"], message_id=row["message_id"])
-    if isinstance(props, types.Error) or not props.can_be_replied_in_another_chat:
-        return None  # e.g. the group forbids copying; the phone-only link stays as a fallback
-    msg = await confirmed(user.sendTextMessage(
-        chat_id=bot_chat_id, text="👆 Open message", disable_notification=True,
-        reply_to=types.InputMessageReplyToExternalMessage(chat_id=row["chat_id"], message_id=row["message_id"]),
-    ))
+async def forward_original(row) -> int | str:
+    """From the owner's account, forward the original message into the bot chat."""
+    res = await user.forwardMessages(chat_id=bot_chat_id, from_chat_id=row["chat_id"],
+                                     message_ids=[row["message_id"]],
+                                     options=types.MessageSendOptions(disable_notification=True))
+    if isinstance(res, types.Error) or not res.messages or res.messages[0] is None:
+        return getattr(res, "message", "Telegram refused it")
+    tmp = res.messages[0]
+    if tmp.sending_state is None:
+        return tmp.id
+    # forwardMessages returns a temporary id; wait for Telegram's final one, like pytdbot does for sends.
+    fut = user._create_request_future({}, result_id=f"{bot_chat_id}:{tmp.id}")
+    msg = await confirmed(fut)
     if isinstance(msg, types.Error):
-        log.warning("Couldn't post the jump message: %s", msg.message)
-        return None
+        return msg.message
     return msg.id
 
 
-async def delete_jump(jump_msg_id: int) -> None:
+async def send_jump(row) -> str | None:
+    """Basic groups have no message links. Instead, from the owner's account, post the original into
+    the bot chat as a forward and/or a quote-reply. Returns the posted ids, comma-separated."""
+    fails = [] if row["link"] else ["link: Telegram gave none"]
+    ids = []
+    if not bot_chat_id:
+        fails.append("forward + quote: couldn't open the bot chat from your account")
+    elif TEST_ALL_JUMPS or is_basic_group_id(row["chat_id"]):
+        props = await user.getMessageProperties(chat_id=row["chat_id"], message_id=row["message_id"])
+        if isinstance(props, types.Error):
+            fails.append(f"forward + quote: {props.message}")
+        else:
+            if not props.can_be_forwarded:
+                fails.append("forward: the group doesn't allow forwarding")
+            elif isinstance(r := await forward_original(row), str):
+                fails.append(f"forward: {r}")
+            else:
+                ids.append(r)
+            if ids and not TEST_ALL_JUMPS:
+                pass  # fallback mode: the forward worked, skip the quote
+            elif not props.can_be_replied_in_another_chat:
+                fails.append("quote: this message can't be quoted in another chat")
+            elif isinstance(r := await quote_original(row), str):
+                fails.append(f"quote: {r}")
+            else:
+                ids.append(r)
+    db.set_jump_note(row["id"], "; ".join(fails) or None)
+    for f in fails:
+        log.warning("Jump method failed for %s: %s", row["chat_title"], f)
+    return ",".join(map(str, ids)) or None
+
+
+async def quote_original(row) -> int | str:
+    """From the owner's account, post a reply to the original message into the bot chat."""
+    msg = await confirmed(user.sendTextMessage(
+        chat_id=bot_chat_id, text="👆 Сообщение из группы", disable_notification=True,
+        reply_to=types.InputMessageReplyToExternalMessage(chat_id=row["chat_id"], message_id=row["message_id"]),
+    ))
+    if isinstance(msg, types.Error):
+        return msg.message
+    return msg.id
+
+
+async def delete_jump(jump_msg_ids) -> None:
     # Your own messages in a private chat can be deleted for both sides at any time.
-    r = await user.deleteMessages(chat_id=bot_chat_id, message_ids=[jump_msg_id], revoke=True)
+    ids = [int(i) for i in str(jump_msg_ids).split(",") if i]
+    r = await user.deleteMessages(chat_id=bot_chat_id, message_ids=ids, revoke=True)
     if isinstance(r, types.Error):
         log.warning("Couldn't delete the jump message: %s", r.message)
 
@@ -301,9 +356,9 @@ async def send_card(row_id: int) -> None:
         row = db.get(row_id)
         if row is None or row["bot_msg_id"]:
             return
-        if not row["jump_msg_id"] and (jump_id := await send_jump(row)):
-            db.set_jump_msg_id(row_id, jump_id)
-            row = db.get(row_id)
+        if not row["jump_msg_id"]:
+            db.set_jump_msg_id(row_id, await send_jump(row))
+            row = db.get(row_id)  # picks up the new jump ids and any failure note
         silent = time.time() - row["date"] > SILENT_AFTER_SECONDS
         if msg_id := await bot_send(*render(row), silent=silent):
             db.set_bot_msg_id(row_id, msg_id)
@@ -329,7 +384,7 @@ async def move_card_down(row_id: int) -> None:
         if row["jump_msg_id"]:
             await delete_jump(row["jump_msg_id"])
         if old := row["bot_msg_id"]:
-            await delete_or_edit(old, "⤵️ Moved down")
+            await delete_or_edit(old, "⤵️ Перенесено вниз")
 
 
 async def delete_or_edit(message_id: int, fallback_text: str) -> None:
@@ -410,7 +465,7 @@ async def mark_read_in_telegram(row) -> None:
 
 
 async def solve(row_id: int, reason: str) -> None:
-    row = await close(row_id, f"✅ Solved — {reason}")
+    row = await close(row_id, f"✅ Решено — {reason}")
     if row and not row["is_read"]:
         await mark_read_in_telegram(row)
     if row:
@@ -436,7 +491,7 @@ async def sync_chat(chat_id: int) -> None:
             return
         if not is_group(chat):  # only groups are tracked; clears anything recorded from other chats
             for row in db.open_in_chat(chat_id):
-                await close(row["id"], "Ignored: not a group chat")
+                await close(row["id"], "Пропущено: это не группа")
             return
         unread: set[int] = set()
         if chat.unread_mention_count:
@@ -472,7 +527,7 @@ async def find_replies(chat_id: int) -> None:
         return
     for m in found.messages:
         if row_id := replied_row(m):
-            await solve(row_id, "you replied")
+            await solve(row_id, "вы ответили")
 
 
 async def catch_up_mentions(chat_id: int, since: int) -> int:
@@ -545,7 +600,7 @@ async def on_new_message(c: Client, u: types.UpdateNewMessage) -> None:
               m.id, m.chat_id, m.is_outgoing, m.contains_unread_mention)
     if m.is_outgoing:
         if row_id := replied_row(m):
-            await solve(row_id, "you replied")
+            await solve(row_id, "вы ответили")
     elif m.contains_unread_mention or mentions_owner(m):
         await add_mention(m)
 
@@ -580,7 +635,7 @@ async def on_deleted(c: Client, u: types.UpdateDeleteMessages) -> None:
     await owner_ready.wait()
     for message_id in u.message_ids:
         if row := db.get_by_message(u.chat_id, message_id):
-            await close(row["id"], "🗑 Message was deleted")
+            await close(row["id"], "🗑 Сообщение удалено")
 
 
 @user.on_updateConnectionState()
@@ -600,17 +655,17 @@ async def on_button(c: Client, u: types.UpdateNewCallbackQuery) -> None:
     action, _, rid = u.text.partition(":")
     row = db.get(int(rid)) if rid.isdigit() else None
     if u.sender_user_id != owner_id:
-        await c.answerCallbackQuery(callback_query_id=u.id, text="Not allowed")
+        await c.answerCallbackQuery(callback_query_id=u.id, text="Нет доступа")
         return
     if row is None:
-        await c.answerCallbackQuery(callback_query_id=u.id, text="Already closed")
+        await c.answerCallbackQuery(callback_query_id=u.id, text="Уже закрыто")
         return
-    await c.answerCallbackQuery(callback_query_id=u.id, text="Marked as read" if action == "r" else "Done ✅")
+    await c.answerCallbackQuery(callback_query_id=u.id, text="Отмечено как прочитанное" if action == "r" else "Готово ✅")
     if action == "r":
         await set_read(row["id"])
         await mark_read_in_telegram(row)
     elif action == "d":
-        await solve(row["id"], "marked done")
+        await solve(row["id"], "отмечено вами")
 
 
 @bot.on_updateNewMessage()
@@ -620,17 +675,19 @@ async def on_command(c: Client, u: types.UpdateNewMessage) -> None:
     if m.chat_id != owner_id or m.is_outgoing:
         return
     command = m.text.split()[0].split("@")[0] if m.text else ""
-    if command == "/list":
+    if command == "/list" or (m.text or "").strip() == LIST_BUTTON:
         rows = db.all_open()
         if not rows:
-            await bot_send("No open problems 🎉")
+            await bot_send("Всё сделано, задач нет 🎉", markup=MAIN_KEYBOARD)
             return
         unread = sum(not r["is_read"] for r in rows)
-        await bot_send(f"📋 <b>{len(rows)}</b> open problem(s), {unread} unread:")
+        await bot_send(f"📋 Задач: <b>{len(rows)}</b>, из них новых: <b>{unread}</b>", markup=MAIN_KEYBOARD)
         for row in rows:
             await move_card_down(row["id"])
     elif command == "/start":
-        await bot_send("Hi! Every mention of you in groups will show up here.\n/list: show all open problems")
+        await bot_send("Здравствуйте! 👋\n\nКогда вас отметят в группе, сообщение появится здесь.\n\n"
+                       "Когда разберётесь — нажмите «✅ Готово».\n"
+                       f"Чтобы увидеть все задачи — нажмите кнопку «{LIST_BUTTON}» внизу.", markup=MAIN_KEYBOARD)
         for row in db.unsent():
             await send_card(row["id"])
 
@@ -669,7 +726,7 @@ async def main() -> None:
                         "phone-only links.", bot_chat.message)
         else:
             bot_chat_id = bot_chat.id  # your account's chat with the bot, for the jump messages
-        await bot.setCommands(commands=[types.BotCommand(command="list", description="Show all open problems")])
+        await bot.setCommands(commands=[types.BotCommand(command="list", description="Показать все задачи")])
         if isinstance(await bot.createPrivateChat(user_id=owner_id), types.Error):
             log.warning("Open the bot in Telegram and press Start, or it can't message you.")
         owner_ready.set()
@@ -677,8 +734,8 @@ async def main() -> None:
                  getattr(bot_me.usernames, "editable_username", "?"))
         await full_sync()
         rows = db.all_open()
-        await bot_send(f"🟢 Tracker is running. Open problems: <b>{len(rows)}</b> "
-                       f"({sum(not r['is_read'] for r in rows)} unread). /list shows them.", silent=True)
+        await bot_send(f"🟢 Бот работает. Задач: <b>{len(rows)}</b>, новых: "
+                       f"<b>{sum(not r['is_read'] for r in rows)}</b>.", markup=MAIN_KEYBOARD, silent=True)
         _heartbeat = asyncio.create_task(heartbeat())
         await stopping.wait()
     finally:
